@@ -1,0 +1,170 @@
+#
+# Build a 32-bit x86 Linux JDK (and JRE) and publish the bundles as a GitHub release.
+#
+# Based on the linux-x86 job that upstream GHA ran before JEP 501 (JDK-8344093)
+# removed it: a "reduced" 32-bit build on a 64-bit Ubuntu runner using gcc
+# multilib and i386 dev packages.
+#
+# Trigger it from the Actions tab ("Run workflow"), or with:
+#   gh workflow run release-linux-x86.yml -f release-tag=<tag>
+#
+
+name: 'Release (linux-x86, 32-bit)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: 'Release tag to create or update (empty = jdk-<version>-linux-x86)'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    name: 'Build and release linux-x86'
+    runs-on: ubuntu-22.04
+    env:
+      CONF_NAME: linux-x86
+      GCC_MAJOR_VERSION: '10'
+
+    steps:
+      - name: 'Checkout the JDK source'
+        uses: actions/checkout@v4
+
+      - name: 'Get the BootJDK'
+        id: bootjdk
+        uses: ./.github/actions/get-bootjdk
+        with:
+          platform: linux-x64
+
+      - name: 'Install toolchain and 32-bit dependencies'
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --only-upgrade apt
+          # Some multilib libraries do not have proper inter-dependencies, so
+          # freetype/tiff/cupsimage/ffi are listed explicitly.
+          sudo apt-get install -y \
+            gcc-${GCC_MAJOR_VERSION}-multilib g++-${GCC_MAJOR_VERSION}-multilib \
+            libxrandr-dev:i386 libxtst-dev:i386 libcups2-dev:i386 libasound2-dev:i386 \
+            libfreetype-dev:i386 libtiff-dev:i386 libcupsimage2-dev:i386 libffi-dev:i386
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_MAJOR_VERSION} 100 \
+            --slave /usr/bin/g++ g++ /usr/bin/g++-${GCC_MAJOR_VERSION}
+
+      # --enable-deprecated-ports: required since JEP 501 deprecated the x86_32 port.
+      # --enable-fallback-linker + libffi bundling: x86_32 has no native FFM linker.
+      # Bundled freetype/zlib/libffi keep the result independent of the target's libraries.
+      # Warnings are not fatal: upstream stopped compiling the full x86_32 JDK in CI
+      # in Aug 2024, so new 32-bit-only warnings would otherwise break the release.
+      - name: 'Configure'
+        run: >
+          bash configure
+          --with-conf-name=${CONF_NAME}
+          --with-debug-level=release
+          --with-target-bits=32
+          --enable-deprecated-ports=yes
+          --enable-fallback-linker
+          --enable-libffi-bundling
+          --with-freetype=bundled
+          --with-zlib=bundled
+          --disable-warnings-as-errors
+          --with-version-opt=${GITHUB_SHA::10}
+          --with-boot-jdk=${{ steps.bootjdk.outputs.path }} || (
+          echo "Dumping config.log:" &&
+          cat config.log &&
+          exit 1)
+
+      - name: 'Build'
+        uses: ./.github/actions/do-build
+        with:
+          make-target: 'product-bundles legacy-bundles'
+          platform: linux-x86
+
+      # The runner's kernel can execute i386 binaries, so the result can be run directly.
+      - name: 'Smoke test the 32-bit JDK'
+        run: |
+          jdk="build/${CONF_NAME}/images/jdk"
+          file -L "$jdk/bin/java"
+          "$jdk/bin/java" -version
+          props="$("$jdk/bin/java" -XshowSettings:properties -version 2>&1)"
+          grep -E 'os\.arch|sun\.arch\.data\.model' <<< "$props"
+          grep -q 'sun.arch.data.model = 32' <<< "$props"
+          cat > "$RUNNER_TEMP/Hello.java" <<'EOF'
+          public class Hello {
+              public static void main(String[] args) {
+                  System.out.println("Hello from " + System.getProperty("os.arch")
+                          + " / Java " + Runtime.version());
+              }
+          }
+          EOF
+          "$jdk/bin/java" "$RUNNER_TEMP/Hello.java"
+
+      - name: 'Prepare release assets'
+        id: assets
+        env:
+          RELEASE_TAG: ${{ inputs.release-tag }}
+        run: |
+          jdk="build/${CONF_NAME}/images/jdk"
+          version="$(sed -n 's/^JAVA_RUNTIME_VERSION="\(.*\)"$/\1/p' "$jdk/release")"
+          if [[ -z "$version" ]]; then
+            echo "Could not read JAVA_RUNTIME_VERSION from $jdk/release" >&2
+            exit 1
+          fi
+          tag="${RELEASE_TAG:-jdk-${version}-linux-x86}"
+
+          mkdir -p release-assets
+          cp build/${CONF_NAME}/bundles/*.tar.gz release-assets/
+          (cd release-assets && sha256sum *.tar.gz > SHA256SUMS.txt)
+          ls -l release-assets
+
+          {
+            echo "OpenJDK built for **Linux x86 (32-bit)** from commit ${GITHUB_SHA}."
+            echo
+            echo '```'
+            "$jdk/bin/java" -version 2>&1
+            echo '```'
+            echo
+            echo '- `jdk-*_bin.tar.gz`: full JDK'
+            echo '- `jre-*_bin.tar.gz`: runtime only'
+            echo '- `*_bin-symbols.tar.gz`: native debug symbols'
+            echo
+            echo 'Requires a 32-bit (i686) glibc Linux system; the build host was Ubuntu 22.04.'
+          } > release-notes.md
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: 'Publish GitHub release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.assets.outputs.tag }}
+          VERSION: ${{ steps.assets.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists, replacing its assets"
+            gh release upload "$TAG" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            flags=()
+            if [[ "$PRERELEASE" == "true" ]]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" release-assets/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "OpenJDK $VERSION for Linux x86 (32-bit)" \
+              --notes-file release-notes.md \
+              "${flags[@]}"
+          fi
+          echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG" >> "$GITHUB_STEP_SUMMARY"
