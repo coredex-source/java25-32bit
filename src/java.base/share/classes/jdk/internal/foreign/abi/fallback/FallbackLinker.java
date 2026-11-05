@@ -255,9 +255,9 @@ public final class FallbackLinker extends AbstractLinker {
             case ValueLayout.OfShort   sl -> argSeg.set(sl, 0, (Short) arg);
             case ValueLayout.OfChar    cl -> argSeg.set(cl, 0, (Character) arg);
             case ValueLayout.OfInt     il -> argSeg.set(il, 0, (Integer) arg);
-            case ValueLayout.OfLong    ll -> argSeg.set(ll, 0, (Long) arg);
+            case ValueLayout.OfLong    ll -> argSeg.set(ll.withByteAlignment(1), 0, (Long) arg); // 32-bit, see readValue
             case ValueLayout.OfFloat   fl -> argSeg.set(fl, 0, (Float) arg);
-            case ValueLayout.OfDouble  dl -> argSeg.set(dl, 0, (Double) arg);
+            case ValueLayout.OfDouble  dl -> argSeg.set(dl.withByteAlignment(1), 0, (Double) arg); // 32-bit, see readValue
             case AddressLayout         al -> argSeg.set(al, 0, (MemorySegment) arg);
             case GroupLayout            _ ->
                     MemorySegment.copy((MemorySegment) arg, 0, argSeg, 0, argSeg.byteSize()); // by-value struct
@@ -279,11 +279,14 @@ public final class FallbackLinker extends AbstractLinker {
         } else if (layout instanceof ValueLayout.OfInt il) {
             return seg.get(il, 0);
         } else if (layout instanceof ValueLayout.OfLong ll) {
-            return seg.get(ll, 0);
+            // 32-bit (own fix, no upstream equivalent: upstream has no x86_32 any more): on i386 libffi's argument and
+            // return slots are only 4-byte aligned, but FFM's long and double layouts need 8, so upcalls taking or
+            // returning them failed the alignment check. Read and write those two unaligned.
+            return seg.get(ll.withByteAlignment(1), 0);
         } else if (layout instanceof ValueLayout.OfFloat fl) {
             return seg.get(fl, 0);
         } else if (layout instanceof ValueLayout.OfDouble dl) {
-            return seg.get(dl, 0);
+            return seg.get(dl.withByteAlignment(1), 0); // 32-bit, see OfLong above
         } else if (layout instanceof AddressLayout al) {
             return seg.get(al, 0);
         } else if (layout instanceof GroupLayout) {
