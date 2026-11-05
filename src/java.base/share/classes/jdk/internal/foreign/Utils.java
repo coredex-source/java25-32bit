@@ -58,23 +58,38 @@ public final class Utils {
 
     private static final MethodHandle BYTE_TO_BOOL;
     private static final MethodHandle BOOL_TO_BYTE;
-    private static final MethodHandle ADDRESS_TO_LONG;
+    // 32-bit: address var handles use an int carrier and int converters on 4-byte platforms. Backported from
+    // jdk-25+13 (the 32-bit part of JDK-8350118). jdk-25+5's code filtered the int handle with long converters
+    // (since JDK-8338677), so every address layout failed there and the fallback linker couldn't initialise.
+    private static final Class<?> ADDRESS_CARRIER_TYPE;
+    private static final MethodHandle LONG_TO_CARRIER;
     private static final MethodHandle LONG_TO_ADDRESS_TARGET;
     private static final MethodHandle LONG_TO_ADDRESS_NO_TARGET;
 
     static {
+        String unboxSegmentName;
+        Class<?> rawAddressType;
+        if (Unsafe.getUnsafe().addressSize() == 8) {
+            unboxSegmentName = "unboxSegment";
+            rawAddressType = long.class;
+        } else {
+            assert Unsafe.getUnsafe().addressSize() == 4 : Unsafe.getUnsafe().addressSize();
+            unboxSegmentName = "unboxSegment32";
+            rawAddressType = int.class;
+        }
+        ADDRESS_CARRIER_TYPE = rawAddressType;
         try {
             MethodHandles.Lookup lookup = MethodHandles.lookup();
             BYTE_TO_BOOL = lookup.findStatic(Utils.class, "byteToBoolean",
                     MethodType.methodType(boolean.class, byte.class));
             BOOL_TO_BYTE = lookup.findStatic(Utils.class, "booleanToByte",
                     MethodType.methodType(byte.class, boolean.class));
-            ADDRESS_TO_LONG = lookup.findStatic(SharedUtils.class, "unboxSegment",
-                    MethodType.methodType(long.class, MemorySegment.class));
+            LONG_TO_CARRIER = lookup.findStatic(SharedUtils.class, unboxSegmentName,
+                    MethodType.methodType(rawAddressType, MemorySegment.class));
             LONG_TO_ADDRESS_TARGET = lookup.findStatic(Utils.class, "longToAddress",
-                    MethodType.methodType(MemorySegment.class, long.class, AddressLayout.class));
+                    MethodType.methodType(MemorySegment.class, rawAddressType, AddressLayout.class));
             LONG_TO_ADDRESS_NO_TARGET = lookup.findStatic(Utils.class, "longToAddress",
-                    MethodType.methodType(MemorySegment.class, long.class));
+                    MethodType.methodType(MemorySegment.class, rawAddressType));
         } catch (Throwable ex) {
             throw new ExceptionInInitializerError(ex);
         }
@@ -113,11 +128,7 @@ public final class Utils {
     private static VarHandle makeRawSegmentViewVarHandleInternal(ValueLayout layout) {
         Class<?> baseCarrier = layout.carrier();
         if (layout.carrier() == MemorySegment.class) {
-            baseCarrier = switch ((int) ValueLayout.ADDRESS.byteSize()) {
-                case Long.BYTES -> long.class;
-                case Integer.BYTES -> int.class;
-                default -> throw new UnsupportedOperationException("Unsupported address layout");
-            };
+            baseCarrier = ADDRESS_CARRIER_TYPE; // jdk-25+13 (JDK-8350118)
         } else if (layout.carrier() == boolean.class) {
             baseCarrier = byte.class;
         }
@@ -131,7 +142,7 @@ public final class Utils {
             MethodHandle longToAddressAdapter = addressLayout.targetLayout().isPresent() ?
                     MethodHandles.insertArguments(LONG_TO_ADDRESS_TARGET, 1, addressLayout) :
                     LONG_TO_ADDRESS_NO_TARGET;
-            handle = MethodHandles.filterValue(handle, ADDRESS_TO_LONG, longToAddressAdapter);
+            handle = MethodHandles.filterValue(handle, LONG_TO_CARRIER, longToAddressAdapter);
         }
         return handle;
     }
@@ -149,8 +160,20 @@ public final class Utils {
         return longToAddress(addr, 0, 1);
     }
 
+    // 32 bit (jdk-25+13, JDK-8350118)
+    @ForceInline
+    public static MemorySegment longToAddress(int addr) {
+        return longToAddress(addr, 0, 1);
+    }
+
     @ForceInline
     public static MemorySegment longToAddress(long addr, AddressLayout layout) {
+        return longToAddress(addr, pointeeByteSize(layout), pointeeByteAlign(layout));
+    }
+
+    // 32 bit (jdk-25+13, JDK-8350118)
+    @ForceInline
+    public static MemorySegment longToAddress(int addr, AddressLayout layout) {
         return longToAddress(addr, pointeeByteSize(layout), pointeeByteAlign(layout));
     }
 

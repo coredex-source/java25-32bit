@@ -326,6 +326,15 @@ public final class SharedUtils {
         return segment.address();
     }
 
+    // 32 bit: backported from jdk-25+13 (the 32-bit part of JDK-8350118), used by Utils for 4-byte address handles.
+    @ForceInline
+    public static int unboxSegment32(MemorySegment segment) {
+        // This cast to 'int' is safe, because we only call this method on 32-bit
+        // platforms, where we know the address of a segment is truncated to 32-bits.
+        // There's a similar cast for 4-byte addresses in Unsafe.putAddress.
+        return (int) unboxSegment(segment);
+    }
+
     public static void checkExceptions(MethodHandle target) {
         Class<?>[] exceptions = JLIA.exceptionTypes(target);
         if (exceptions != null && exceptions.length != 0) {
